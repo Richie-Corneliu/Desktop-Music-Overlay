@@ -15,6 +15,10 @@ const {
 } = require('electron');
 const win32 = require('./win32-desktop');
 
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=96');
+app.commandLine.appendSwitch('disable-spell-checking');
+app.commandLine.appendSwitch('disable-component-update');
+
 const projectRoot = path.resolve(__dirname, '..', '..');
 const backendPython = path.join(projectRoot, 'backend', '.venv', 'Scripts', 'python.exe');
 const backendScript = path.join(projectRoot, 'backend', 'server.py');
@@ -52,8 +56,42 @@ let mainWindow = null;
 let tray = null;
 let isAlwaysOnTop = false;
 let isVisible = true;
+let isOccluded = false;
 let isQuitting = false;
 let managedBackendProc = null;
+let occlusionTimer = null;
+
+const OCCLUSION_POLL_INTERVAL_MS = 1500;
+
+function setOccludedState(next) {
+  const occluded = Boolean(next);
+  if (occluded === isOccluded) return;
+  isOccluded = occluded;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('overlay:occluded', isOccluded);
+  }
+}
+
+function checkDesktopOcclusion() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (isAlwaysOnTop || !isVisible) {
+    setOccludedState(false);
+    return;
+  }
+  setOccludedState(win32.isDesktopOccluded(mainWindow));
+}
+
+function startOcclusionPolling() {
+  if (occlusionTimer !== null || smokeExitMs !== null) return;
+  occlusionTimer = setInterval(checkDesktopOcclusion, OCCLUSION_POLL_INTERVAL_MS);
+}
+
+function stopOcclusionPolling() {
+  if (occlusionTimer !== null) {
+    clearInterval(occlusionTimer);
+    occlusionTimer = null;
+  }
+}
 
 function isPortOpen(host = '127.0.0.1', port = 8765, timeoutMs = 350) {
   return new Promise((resolve) => {
@@ -217,9 +255,11 @@ function rebuildTrayMenu() {
         if (isAlwaysOnTop) {
           mainWindow.setAlwaysOnTop(true, 'screen-saver');
           win32.setTopmostMode(mainWindow, true);
+          setOccludedState(false);
         } else {
           mainWindow.setAlwaysOnTop(false);
           win32.setTopmostMode(mainWindow, false);
+          checkDesktopOcclusion();
         }
         rebuildTrayMenu();
       },
@@ -266,11 +306,14 @@ function toggleOverlayVisibility() {
     if (isAlwaysOnTop) {
       mainWindow.setAlwaysOnTop(true, 'screen-saver');
       win32.setTopmostMode(mainWindow, true);
+      setOccludedState(false);
     } else {
       win32.attachDesktopMode(mainWindow);
+      checkDesktopOcclusion();
     }
   } else {
     mainWindow.hide();
+    setOccludedState(false);
   }
   mainWindow.webContents.send('overlay:visibility', isVisible);
   rebuildTrayMenu();
@@ -370,6 +413,13 @@ app.whenReady().then(async () => {
   screen.on('display-metrics-changed', syncWorkAreaBounds);
   screen.on('display-added', syncWorkAreaBounds);
   screen.on('display-removed', syncWorkAreaBounds);
+  win.webContents.on('did-finish-load', () => {
+    if (!win.isDestroyed()) {
+      if (!isVisible) win.webContents.send('overlay:visibility', false);
+      if (isOccluded) win.webContents.send('overlay:occluded', true);
+    }
+  });
+  startOcclusionPolling();
 
   if (smokeExitMs !== null) {
     win.webContents.on('console-message', (event) => {
@@ -450,8 +500,15 @@ app.whenReady().then(async () => {
           const tabRecent = document.getElementById('tab-recent');
           const viz = document.getElementById('visualizer-region');
 
+          const drawerClosedBefore = getComputedStyle(drawer).display === 'none';
+          const drawerNoBlurWhenClosed = getComputedStyle(drawer).backdropFilter === 'none';
+          const rotorNoBlur = rotorEls.every((el) => getComputedStyle(el).filter === 'none');
+          const canvas = document.getElementById('visualizer-canvas');
+          const vizWrap = document.querySelector('.visualizer-wrap');
+          const dynScaleRatio = canvas && canvas.clientWidth ? canvas.width / canvas.clientWidth : 0;
+
           trigger.click();
-          const drawerOpened = !drawer.hidden && drawer.classList.contains('is-open');
+          const drawerOpened = !drawer.hidden && drawer.classList.contains('is-open') && getComputedStyle(drawer).display === 'flex';
           lockBtn.click();
           const editUnlocked = document.body.classList.contains('is-layout-editing') && viz.classList.contains('interactive');
           viz.dispatchEvent(new WheelEvent('wheel', { deltaY: -120, cancelable: true }));
@@ -469,8 +526,10 @@ app.whenReady().then(async () => {
 
           edgeOffBtn.click();
           const edgeDisabled = edgeEl.classList.contains('is-disabled');
+          const offScaleRatio = canvas && canvas.clientWidth ? canvas.width / canvas.clientWidth : 0;
           edgeMinimalBtn.click();
           const edgeMinimalist = !edgeEl.classList.contains('is-disabled') && edgeEl.style.getPropertyValue('--beat-pulse') === '0.22';
+          const minScaleRatio = canvas && canvas.clientWidth ? canvas.width / canvas.clientWidth : 0;
           edgeDynamicBtn.click();
           const edgeReenabled = !edgeEl.classList.contains('is-disabled');
 
@@ -495,6 +554,12 @@ app.whenReady().then(async () => {
           const cfg = JSON.parse(localStorage.getItem('music-overlay-config-v1') || '{}');
           trigger.click();
           return {
+            drawerClosedBefore,
+            drawerNoBlurWhenClosed,
+            rotorNoBlur,
+            dynScaleRatio: Math.round(dynScaleRatio * 100) / 100,
+            offScaleRatio: Math.round(offScaleRatio * 100) / 100,
+            minScaleRatio: Math.round(minScaleRatio * 100) / 100,
             drawerOpened,
             editUnlocked,
             themeAfter,
@@ -615,6 +680,7 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  stopOcclusionPolling();
   stopManagedBackend();
   if (smokeUserDataDir) {
     try {

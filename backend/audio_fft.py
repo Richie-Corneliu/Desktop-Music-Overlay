@@ -8,7 +8,7 @@ import logging
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -202,10 +202,10 @@ class FFTProcessor:
         self._noise_floor_db = -54.0
         self._peak_db = -18.0
 
-    def process(
+    def _compute_smoothed(
         self, mono_samples: np.ndarray | None
-    ) -> tuple[list[float], float, float, bool]:
-        """Process mono samples and return (64_bins, energy, peak, active)."""
+    ) -> tuple[float, float, bool]:
+        """Update smoothed 64-bin state and return (energy, peak, active)."""
         active = False
         target = np.zeros(self.num_bins, dtype=np.float32)
 
@@ -244,8 +244,25 @@ class FFTProcessor:
 
         energy = float(np.mean(self._smoothed))
         peak = float(np.max(self._smoothed))
+        return energy, peak, active
+
+    def process(
+        self, mono_samples: np.ndarray | None
+    ) -> tuple[list[float], float, float, bool]:
+        """Process mono samples and return (64_bins, energy, peak, active)."""
+        energy, peak, active = self._compute_smoothed(mono_samples)
         bins = [round(float(x), 3) for x in self._smoothed]
         return bins, round(energy, 3), round(peak, 3), active
+
+    def process_quantized(
+        self, mono_samples: np.ndarray | None
+    ) -> tuple[bytes, float, float, bool]:
+        """Process mono samples and return (64_uint8_bytes, energy, peak, active)."""
+        energy, peak, active = self._compute_smoothed(mono_samples)
+        frame_bytes = (
+            np.rint(self._smoothed * 255.0).clip(0.0, 255.0).astype(np.uint8).tobytes()
+        )
+        return frame_bytes, energy, peak, active
 
 
 class AudioLoopbackCapture:
@@ -268,7 +285,10 @@ class AudioLoopbackCapture:
         self._ring = np.zeros(self.fft_size, dtype=np.float32)
         self._write_idx = 0
         self._last_audio_ts = 0.0
+        self._last_signal_ts = 0.0
         self._last_start_attempt = 0.0
+        self._signal_callback: Callable[[], None] | None = None
+        self._signal_notify_armed = False
 
         self._pa: pyaudio.PyAudio | None = None
         self._stream: Any = None
@@ -314,6 +334,14 @@ class AudioLoopbackCapture:
         with pyaudio.PyAudio() as pa:
             return cls._find_default_loopback_on(pa)
 
+    def set_signal_callback(self, callback: Callable[[], None] | None) -> None:
+        """Register an optional callback fired when audio returns while idle-armed."""
+        self._signal_callback = callback
+
+    def arm_signal_wakeup(self, armed: bool = True) -> None:
+        """Enable or disable one-shot callback notification on next non-silent buffer."""
+        self._signal_notify_armed = bool(armed)
+
     def _stream_callback(
         self,
         in_data: bytes | None,
@@ -333,12 +361,24 @@ class AudioLoopbackCapture:
                 mono = samples
 
             if len(mono) > 0:
-                mono_f32 = (mono.astype(np.float32) * self._sample_scale).ravel()
+                if mono.dtype == np.float32 and self._sample_scale == 1.0:
+                    mono_f32 = mono.ravel()
+                else:
+                    mono_f32 = (mono.astype(np.float32) * self._sample_scale).ravel()
+
+                has_signal = False
+                if float(np.max(np.abs(mono_f32))) >= 1e-5:
+                    rms = float(np.sqrt(np.mean(mono_f32 * mono_f32)))
+                    has_signal = rms >= 1e-5
+
+                now_mono = time.monotonic()
                 if len(mono_f32) >= self.fft_size:
                     with self._lock:
                         self._ring[:] = mono_f32[-self.fft_size :]
                         self._write_idx = 0
-                        self._last_audio_ts = time.monotonic()
+                        self._last_audio_ts = now_mono
+                        if has_signal:
+                            self._last_signal_ts = now_mono
                 else:
                     n = len(mono_f32)
                     with self._lock:
@@ -350,7 +390,18 @@ class AudioLoopbackCapture:
                             self._ring[self._write_idx :] = mono_f32[:first]
                             self._ring[: n - first] = mono_f32[first:]
                         self._write_idx = end % self.fft_size
-                        self._last_audio_ts = time.monotonic()
+                        self._last_audio_ts = now_mono
+                        if has_signal:
+                            self._last_signal_ts = now_mono
+
+                if has_signal and self._signal_notify_armed:
+                    self._signal_notify_armed = False
+                    cb = self._signal_callback
+                    if cb is not None:
+                        try:
+                            cb()
+                        except Exception:
+                            pass
 
         return (None, pyaudio.paContinue)
 
@@ -475,25 +526,30 @@ class AudioLoopbackCapture:
                     self._ring.fill(0.0)
                     self._write_idx = 0
                     self._last_audio_ts = 0.0
+                    self._last_signal_ts = 0.0
                 return self.start()
             return False
 
+    def _snapshot_samples(self) -> np.ndarray | None:
+        now = time.monotonic()
+        if now - self._last_audio_ts > 0.12:
+            return None
+        with self._lock:
+            idx = self._write_idx
+            if idx == 0:
+                return self._ring.copy()
+            return np.concatenate((self._ring[idx:], self._ring[:idx]))
+
     def get_frame(self) -> dict[str, Any]:
         """Return latest smoothed 64-bin FFT payload, decaying cleanly on silence."""
-        now = time.monotonic()
-        samples: np.ndarray | None = None
-        if now - self._last_audio_ts <= 0.12:
-            with self._lock:
-                idx = self._write_idx
-                if idx == 0:
-                    samples = self._ring.copy()
-                else:
-                    samples = np.concatenate((self._ring[idx:], self._ring[:idx]))
-
-        bins, energy, peak, active = self.processor.process(samples)
+        bins, energy, peak, active = self.processor.process(self._snapshot_samples())
         return {
             "bins": bins,
             "energy": energy,
             "peak": peak,
             "active": active,
         }
+
+    def get_binary_frame(self) -> tuple[bytes, float, float, bool]:
+        """Return latest smoothed 64-byte quantized FFT payload and activity stats."""
+        return self.processor.process_quantized(self._snapshot_samples())

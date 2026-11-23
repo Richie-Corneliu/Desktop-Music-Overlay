@@ -196,7 +196,10 @@ let lastExtractedThumbSrc = '';
 let paletteExtractSeq = 0;
 let audioActive = false;
 let overlayVisible = true;
+let isOccluded = false;
 let rafId = null;
+let lastFrameRenderMs = 0;
+let forceImmediateFrame = true;
 let isDraggingLayout = false;
 
 // Click-through forwarding: allow clicks only when cursor hovers an .interactive element or during layout drag
@@ -315,6 +318,9 @@ const wsClient = new OverlayWSClient({
     isConnected = connected;
     if (connected) {
       console.info('[overlay] ws connected');
+      if (!overlayVisible || isOccluded) {
+        wsClient.setAudioPaused(true);
+      }
     } else {
       currentMedia = null;
       audioActive = false;
@@ -341,17 +347,19 @@ const wsClient = new OverlayWSClient({
     requestRender();
   },
   onPosition() {
-    if (currentMedia) {
+    if (currentMedia && overlayVisible && !isOccluded) {
       lyricsView.updatePosition(wsClient.getPosition());
     }
   },
   onAudio(frame) {
-    const nextActive = Boolean(frame?.active) && Number(frame?.energy || 0) > 0.001;
+    const nextActive =
+      Boolean(frame?.active) &&
+      (Number(frame?.energy || 0) > 0.001 || Number(frame?.peak || 0) > 0.008);
     const shouldWake = nextActive || audioActive;
     audioActive = nextActive;
     visualizer.updateAudio(frame?.bins, Boolean(frame?.active));
     if (shouldWake) {
-      requestRender();
+      requestRender(false);
     }
   },
   onLyrics(payload) {
@@ -447,6 +455,7 @@ const layoutManager = new LayoutManager({
   },
   onEdgeGlowChange(mode) {
     edgeGlowMode = ['off', 'minimalist', 'dynamic'].includes(mode) ? mode : 'dynamic';
+    visualizer.setEdgeGlowMode(edgeGlowMode);
     updateScreenEdgeGlow(lastGlowFrame);
     requestRender();
   },
@@ -488,9 +497,26 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
+function getTargetFrameIntervalMs() {
+  if (edgeGlowMode === 'minimalist' || nightBrightnessPct < 70 || sleepDimActive) {
+    return 1000 / 30;
+  }
+  return 1000 / 60;
+}
+
 function renderFrame(nowMs) {
   rafId = null;
-  if (!overlayVisible) return;
+  if (!overlayVisible || isOccluded) return;
+
+  const minIntervalMs = getTargetFrameIntervalMs();
+  const elapsedMs = nowMs - lastFrameRenderMs;
+  if (!forceImmediateFrame && lastFrameRenderMs > 0 && elapsedMs < minIntervalMs - 2.5) {
+    rafId = requestAnimationFrame(renderFrame);
+    return;
+  }
+
+  forceImmediateFrame = false;
+  lastFrameRenderMs = nowMs;
 
   const isPlaying = currentMedia?.playback_status === 'playing';
   if (isPlaying) {
@@ -505,25 +531,46 @@ function renderFrame(nowMs) {
   }
 }
 
-function requestRender() {
-  if (!overlayVisible || rafId !== null) return;
+function requestRender(immediate = true) {
+  if (!overlayVisible || isOccluded) return;
+  if (immediate) {
+    forceImmediateFrame = true;
+  }
+  if (rafId !== null) return;
   rafId = requestAnimationFrame(renderFrame);
 }
 
-window.overlayAPI?.onVisibilityChange((visible) => {
-  overlayVisible = visible;
-  if (!visible) {
-    dock.close();
-    if (layoutManager.isEditMode) {
-      layoutManager.setEditMode(false);
-    }
+function syncOverlayRuntimeState() {
+  const paused = !overlayVisible || isOccluded;
+  document.body.classList.toggle('is-occluded', paused);
+  if (paused) {
     if (rafId !== null) {
       cancelAnimationFrame(rafId);
       rafId = null;
     }
+    wsClient.setAudioPaused(true);
   } else {
-    requestRender();
+    wsClient.setAudioPaused(false);
+    requestRender(true);
   }
+}
+
+window.overlayAPI?.onVisibilityChange((visible) => {
+  overlayVisible = Boolean(visible);
+  if (!overlayVisible) {
+    dock.close();
+    if (layoutManager.isEditMode) {
+      layoutManager.setEditMode(false);
+    }
+  }
+  syncOverlayRuntimeState();
+});
+
+window.overlayAPI?.onOcclusionChange?.((occluded) => {
+  const next = Boolean(occluded);
+  if (next === isOccluded) return;
+  isOccluded = next;
+  syncOverlayRuntimeState();
 });
 
 window.addEventListener('resize', () => {

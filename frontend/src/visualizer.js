@@ -74,6 +74,7 @@ export class CircularVisualizer {
 
     this._bins = new Float32Array(FFT_BIN_COUNT);
     this._themeMode = 'dynamic';
+    this._edgeGlowMode = 'dynamic';
     this._isPlaying = false;
     this._audioActive = false;
     this._reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -151,6 +152,13 @@ export class CircularVisualizer {
     this._themeMode = mode || 'dynamic';
   }
 
+  setEdgeGlowMode(mode) {
+    const next = ['off', 'minimalist', 'dynamic'].includes(mode) ? mode : 'dynamic';
+    if (next === this._edgeGlowMode) return;
+    this._edgeGlowMode = next;
+    this.resize();
+  }
+
   setTargetPalette(palette) {
     if (!palette || !palette.primary || !palette.secondary || !palette.tertiary) {
       return;
@@ -172,7 +180,8 @@ export class CircularVisualizer {
     }
     const count = Math.min(FFT_BIN_COUNT, bins.length);
     for (let i = 0; i < count; i++) {
-      this._bins[i] = clamp(Number(bins[i]) || 0, 0, 1);
+      const val = bins[i];
+      this._bins[i] = val > 0 ? (val < 1 ? val : 1) : 0;
     }
   }
 
@@ -196,8 +205,9 @@ export class CircularVisualizer {
 
     const width = Math.max(240, this._canvas.clientWidth || 640);
     const height = Math.max(240, this._canvas.clientHeight || 640);
+    const maxDpr = this._edgeGlowMode === 'dynamic' ? 1.5 : 1.25;
     const baseDpr = Math.max(1, window.devicePixelRatio || 1);
-    const dpr = Math.min(4, baseDpr * Math.max(1, this._cssScale));
+    const dpr = Math.min(maxDpr, baseDpr * Math.max(1, this._cssScale));
 
     this._width = width;
     this._height = height;

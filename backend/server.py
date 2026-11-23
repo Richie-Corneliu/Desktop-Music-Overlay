@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import numpy as np
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
@@ -43,6 +44,11 @@ else:
     from .smtc import SMTCReader
 
 logger = logging.getLogger(__name__)
+
+AUDIO_SILENCE_IDLE_SECONDS = 2.0
+AUDIO_IDLE_POLL_INTERVAL = 0.2
+AUDIO_SILENCE_PEAK_THRESHOLD = 0.004
+ZERO_AUDIO_FRAME = b"\x00" * 64
 
 
 def _empty_lyrics_payload(track_id: str | None = None, status: str = "not_found") -> dict[str, Any]:
@@ -78,6 +84,7 @@ class MusicOverlayServer:
         self.artwork = artwork or ArtworkService()
 
         self.clients: set[ServerConnection] = set()
+        self._paused_clients: set[ServerConnection] = set()
         self.current_media: dict[str, Any] | None = None
         self.current_lyrics: dict[str, Any] | None = None
 
@@ -88,6 +95,7 @@ class MusicOverlayServer:
         self._hd_artwork_track_id: str | None = None
         self._hd_artwork_uri: str | None = None
         self._poll_wakeup = asyncio.Event()
+        self._audio_wakeup = asyncio.Event()
         self._running = False
 
     async def _send_json(self, ws: ServerConnection, payload: dict[str, Any]) -> None:
@@ -98,12 +106,14 @@ class MusicOverlayServer:
         except Exception as exc:
             logger.debug("Failed sending message to client: %s", exc)
 
-    async def _broadcast(self, payload: dict[str, Any]) -> None:
-        if not self.clients:
+    async def _send_raw(
+        self, raw: str | bytes, targets: list[ServerConnection] | None = None
+    ) -> None:
+        conns = targets if targets is not None else list(self.clients)
+        if not conns:
             return
-        raw = json.dumps(payload, ensure_ascii=False)
         stale: list[ServerConnection] = []
-        for ws in list(self.clients):
+        for ws in conns:
             try:
                 await ws.send(raw)
             except ConnectionClosed:
@@ -113,6 +123,12 @@ class MusicOverlayServer:
                 stale.append(ws)
         for ws in stale:
             self.clients.discard(ws)
+            self._paused_clients.discard(ws)
+
+    async def _broadcast(self, payload: dict[str, Any]) -> None:
+        if not self.clients:
+            return
+        await self._send_raw(json.dumps(payload, ensure_ascii=False))
 
     def _schedule_lyrics_fetch(
         self, media: dict[str, Any], force_refresh: bool = False
@@ -177,6 +193,8 @@ class MusicOverlayServer:
                 self._artwork_task.cancel()
 
             self.current_media = new_media
+            if new_media and new_media.get("playback_status") == "playing":
+                self._audio_wakeup.set()
             await self._broadcast({"type": "state", "media": new_media})
 
             if new_media is not None:
@@ -207,7 +225,10 @@ class MusicOverlayServer:
             or pos_jump > 1.5
         )
         if state_changed:
+            was_playing = old_media.get("playback_status") == "playing"
             self.current_media = new_media
+            if not was_playing and new_media.get("playback_status") == "playing":
+                self._audio_wakeup.set()
             await self._broadcast({"type": "state", "media": new_media})
         elif (
             new_media["playback_status"] == "playing"
@@ -243,9 +264,17 @@ class MusicOverlayServer:
                 pass
 
     async def _audio_loop(self) -> None:
-        interval = 1.0 / float(FFT_FPS)
+        active_interval = 1.0 / float(FFT_FPS)
         loop = asyncio.get_running_loop()
-        next_tick = loop.time()
+
+        def _wake_from_audio_thread() -> None:
+            if self._running:
+                loop.call_soon_threadsafe(self._audio_wakeup.set)
+
+        set_cb = getattr(self.audio, "set_signal_callback", None)
+        arm_wake = getattr(self.audio, "arm_signal_wakeup", None)
+        if callable(set_cb):
+            set_cb(_wake_from_audio_thread)
 
         try:
             await asyncio.to_thread(self.audio.start)
@@ -254,6 +283,10 @@ class MusicOverlayServer:
 
         last_rebind_check = loop.time()
         rebind_task: asyncio.Task[bool] | None = None
+        silence_since: float | None = None
+        deep_idle = False
+        sent_zero_idle = False
+        next_tick = loop.time()
 
         try:
             while self._running:
@@ -268,18 +301,99 @@ class MusicOverlayServer:
                         name="wasapi_audio_rebind",
                     )
 
-                if self.clients:
-                    frame = self.audio.get_frame()
-                    await self._broadcast({"type": "audio", **frame})
+                active_clients = [
+                    ws for ws in self.clients if ws not in self._paused_clients
+                ]
 
-                next_tick += interval
-                now = loop.time()
-                sleep_for = next_tick - now
-                if sleep_for < -interval:
-                    next_tick = now
-                    sleep_for = interval
-                await asyncio.sleep(max(0.001, sleep_for))
+                if not active_clients:
+                    silence_since = None
+                    if not deep_idle:
+                        deep_idle = True
+                        sent_zero_idle = False
+                    if callable(arm_wake):
+                        arm_wake(False)
+                    try:
+                        await asyncio.wait_for(
+                            self._audio_wakeup.wait(), timeout=AUDIO_IDLE_POLL_INTERVAL
+                        )
+                        self._audio_wakeup.clear()
+                    except asyncio.TimeoutError:
+                        pass
+                    next_tick = loop.time()
+                    continue
+
+                is_playing = bool(
+                    self.current_media
+                    and self.current_media.get("playback_status") == "playing"
+                )
+
+                if hasattr(self.audio, "get_binary_frame"):
+                    frame_bytes, _energy, peak, active = self.audio.get_binary_frame()
+                else:
+                    frame = self.audio.get_frame()
+                    bins = frame.get("bins") or []
+                    arr = np.clip(
+                        np.rint(np.asarray(bins, dtype=np.float32) * 255.0), 0, 255
+                    ).astype(np.uint8)
+                    frame_bytes = arr.tobytes()[:64].ljust(64, b"\x00")
+                    peak = float(frame.get("peak") or 0.0)
+                    active = bool(frame.get("active"))
+
+                near_zero = (not active) and peak <= AUDIO_SILENCE_PEAK_THRESHOLD
+
+                if is_playing or not near_zero:
+                    silence_since = None
+                    if deep_idle:
+                        deep_idle = False
+                        self._audio_wakeup.clear()
+                        next_tick = loop.time()
+                    sent_zero_idle = False
+                    if callable(arm_wake):
+                        arm_wake(False)
+                    await self._send_raw(frame_bytes, targets=active_clients)
+                else:
+                    if silence_since is None:
+                        silence_since = now
+
+                    if (now - silence_since) > AUDIO_SILENCE_IDLE_SECONDS:
+                        if not sent_zero_idle:
+                            await self._send_raw(ZERO_AUDIO_FRAME, targets=active_clients)
+                            sent_zero_idle = True
+                        if not deep_idle:
+                            deep_idle = True
+                            self._audio_wakeup.clear()
+                        if callable(arm_wake):
+                            arm_wake(True)
+                    else:
+                        if deep_idle:
+                            deep_idle = False
+                            self._audio_wakeup.clear()
+                            next_tick = loop.time()
+                        sent_zero_idle = False
+                        if callable(arm_wake):
+                            arm_wake(False)
+                        await self._send_raw(frame_bytes, targets=active_clients)
+
+                if deep_idle:
+                    try:
+                        await asyncio.wait_for(
+                            self._audio_wakeup.wait(), timeout=AUDIO_IDLE_POLL_INTERVAL
+                        )
+                        self._audio_wakeup.clear()
+                    except asyncio.TimeoutError:
+                        pass
+                    next_tick = loop.time()
+                else:
+                    next_tick += active_interval
+                    now = loop.time()
+                    sleep_for = next_tick - now
+                    if sleep_for < -active_interval:
+                        next_tick = now
+                        sleep_for = active_interval
+                    await asyncio.sleep(max(0.001, sleep_for))
         finally:
+            if callable(set_cb):
+                set_cb(None)
             if rebind_task is not None and not rebind_task.done():
                 rebind_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -385,6 +499,31 @@ class MusicOverlayServer:
             )
             return
 
+        if action in ("set_audio_paused", "pause_audio", "resume_audio"):
+            if action == "pause_audio":
+                paused = True
+            elif action == "resume_audio":
+                paused = False
+            else:
+                paused = bool(msg.get("paused", True))
+
+            if paused:
+                self._paused_clients.add(ws)
+            else:
+                self._paused_clients.discard(ws)
+                self._audio_wakeup.set()
+
+            await self._send_json(
+                ws,
+                {
+                    "type": "ack",
+                    "command": action,
+                    "ok": True,
+                    "detail": "Audio paused" if paused else "Audio resumed",
+                },
+            )
+            return
+
         await self._send_json(
             ws,
             {"type": "ack", "command": action, "ok": False, "detail": f"Unknown action: {action}"},
@@ -392,6 +531,7 @@ class MusicOverlayServer:
 
     async def _ws_handler(self, websocket: ServerConnection) -> None:
         self.clients.add(websocket)
+        self._audio_wakeup.set()
         logger.info("Client connected (%d total)", len(self.clients))
         try:
             await self._send_full_snapshot(websocket)
@@ -401,6 +541,7 @@ class MusicOverlayServer:
             pass
         finally:
             self.clients.discard(websocket)
+            self._paused_clients.discard(websocket)
             logger.info("Client disconnected (%d total)", len(self.clients))
 
     async def start(self) -> None:

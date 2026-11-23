@@ -17,4 +17,14 @@ contextBridge.exposeInMainWorld('overlayAPI', {
       ipcRenderer.removeListener('overlay:visibility', listener);
     };
   },
+  onOcclusionChange(callback) {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, occluded) => {
+      callback(Boolean(occluded));
+    };
+    ipcRenderer.on('overlay:occluded', listener);
+    return () => {
+      ipcRenderer.removeListener('overlay:occluded', listener);
+    };
+  },
 });

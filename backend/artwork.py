@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -13,6 +14,12 @@ import time
 from typing import Any
 
 import httpx
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:  # pragma: no cover - optional fallback if Pillow absent
+    Image = None  # type: ignore[assignment]
+    ImageOps = None  # type: ignore[assignment]
 
 from .config import (
     ARTWORK_CACHE_MAX_ENTRIES,
@@ -30,6 +37,72 @@ logger = logging.getLogger(__name__)
 _ITUNES_SIZE_RE = re.compile(r"/\d+x\d+bb([.-])", re.IGNORECASE)
 _PRIMARY_ARTIST_SPLIT_RE = re.compile(r"\s*(?:,|&|\bfeat\.?\b|\bft\.?\b|\bx\b)\s*", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]+")
+
+ARTWORK_MAX_DIMENSION = 512
+ARTWORK_WEBP_QUALITY = 88
+ARTWORK_JPEG_QUALITY = 90
+
+
+def _resize_cover_bytes(raw: bytes, fallback_mime: str) -> tuple[bytes, str, bool]:
+    """Resize cover artwork to max 512x512 and encode as high-quality WebP/JPEG."""
+    if Image is None:
+        return raw, fallback_mime, False
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            img = ImageOps.exif_transpose(opened) if ImageOps is not None else opened
+            try:
+                width, height = img.size
+                was_resized = max(width, height) > ARTWORK_MAX_DIMENSION
+                if was_resized:
+                    resample = (
+                        Image.Resampling.LANCZOS
+                        if hasattr(Image, "Resampling")
+                        else Image.LANCZOS
+                    )
+                    img.thumbnail((ARTWORK_MAX_DIMENSION, ARTWORK_MAX_DIMENSION), resample)
+
+                has_alpha = img.mode in ("RGBA", "LA") or (
+                    img.mode == "P" and "transparency" in img.info
+                )
+                target = img.convert("RGBA" if has_alpha else "RGB")
+                try:
+                    out = io.BytesIO()
+                    try:
+                        target.save(
+                            out,
+                            format="WEBP",
+                            quality=ARTWORK_WEBP_QUALITY,
+                            method=4,
+                        )
+                        encoded_bytes = out.getvalue()
+                        out_mime = "image/webp"
+                    except Exception:
+                        out = io.BytesIO()
+                        rgb = target.convert("RGB")
+                        try:
+                            rgb.save(
+                                out,
+                                format="JPEG",
+                                quality=ARTWORK_JPEG_QUALITY,
+                                optimize=True,
+                            )
+                        finally:
+                            if rgb is not target:
+                                rgb.close()
+                        encoded_bytes = out.getvalue()
+                        out_mime = "image/jpeg"
+                finally:
+                    if target is not img:
+                        target.close()
+
+                if not was_resized and len(encoded_bytes) >= len(raw):
+                    return raw, fallback_mime, True
+                return encoded_bytes, out_mime, True
+            finally:
+                if img is not opened:
+                    img.close()
+    except Exception:
+        return raw, fallback_mime, False
 
 
 def _norm_cmp(text: str | None) -> str:
@@ -245,11 +318,27 @@ class ArtworkService:
             if ct and not ct.startswith("image/") and ct != "application/octet-stream":
                 return None
             mime = _guess_image_mime(raw, ct)
-            encoded = base64.b64encode(raw).decode("ascii")
-            return f"data:{mime};base64,{encoded}"
+            processed, out_mime, _ = await asyncio.to_thread(_resize_cover_bytes, raw, mime)
+            encoded = base64.b64encode(processed).decode("ascii")
+            return f"data:{out_mime};base64,{encoded}"
         except Exception as exc:
             logger.debug("Failed downloading HD artwork %s: %s", image_url, exc)
             return None
+
+    async def _optimize_cached_data_uri(self, data_uri: str) -> str | None:
+        header, sep, b64_payload = data_uri.partition(",")
+        if not sep or ";base64" not in header:
+            return None
+        try:
+            raw = base64.b64decode(b64_payload, validate=False)
+        except Exception:
+            return None
+        mime = header[5:].split(";", 1)[0] or "image/jpeg"
+        processed, out_mime, ok = await asyncio.to_thread(_resize_cover_bytes, raw, mime)
+        if not ok or len(processed) >= len(raw):
+            return None
+        encoded = base64.b64encode(processed).decode("ascii")
+        return f"data:{out_mime};base64,{encoded}"
 
     async def get_hd_artwork(self, title: str, artist: str) -> str | None:
         """Return a cached or freshly fetched HD cover data URI, or None."""
@@ -264,6 +353,13 @@ class ArtworkService:
             status = cached.get("status")
             data_uri = cached.get("data_uri")
             if status == "found" and isinstance(data_uri, str) and data_uri.startswith("data:image/"):
+                if not cached.get("optimized") and len(data_uri) > 100_000:
+                    shrunk = await self._optimize_cached_data_uri(data_uri)
+                    if shrunk and len(shrunk) < len(data_uri):
+                        cached["data_uri"] = shrunk
+                        data_uri = shrunk
+                    cached["optimized"] = True
+                    self._save_cache()
                 cached["fetched_at"] = int(time.time())
                 return data_uri
             age = int(time.time()) - int(cached.get("fetched_at", 0))
@@ -293,6 +389,7 @@ class ArtworkService:
                         "source": source,
                         "image_url": image_url,
                         "data_uri": data_uri,
+                        "optimized": True,
                         "fetched_at": now,
                     }
                     self._save_cache()

@@ -28,6 +28,14 @@ export class OverlayWSClient {
     this._anchorMs = performance.now();
     this._duration = 0;
     this._playing = false;
+
+    this._audioBins = new Float32Array(64);
+    this._audioFrame = {
+      bins: this._audioBins,
+      energy: 0,
+      peak: 0,
+      active: false,
+    };
   }
 
   connect() {
@@ -36,6 +44,7 @@ export class OverlayWSClient {
 
     try {
       this._ws = new WebSocket(this.url);
+      this._ws.binaryType = 'arraybuffer';
     } catch {
       this._scheduleReconnect();
       return;
@@ -47,6 +56,10 @@ export class OverlayWSClient {
     });
 
     this._ws.addEventListener('message', (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        this._handleBinaryAudio(event.data);
+        return;
+      }
       let msg;
       try {
         msg = JSON.parse(event.data);
@@ -121,6 +134,25 @@ export class OverlayWSClient {
     this._playing = nextPlaying;
   }
 
+  _handleBinaryAudio(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length !== 64) return;
+
+    let sum = 0;
+    let peak = 0;
+    for (let i = 0; i < 64; i += 1) {
+      const norm = bytes[i] * (1 / 255);
+      this._audioBins[i] = norm;
+      sum += norm;
+      if (norm > peak) peak = norm;
+    }
+
+    this._audioFrame.energy = sum / 64;
+    this._audioFrame.peak = peak;
+    this._audioFrame.active = peak > 0.004;
+    this.onAudio?.(this._audioFrame);
+  }
+
   _handleMessage(msg) {
     switch (msg?.type) {
       case 'state': {
@@ -177,6 +209,10 @@ export class OverlayWSClient {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return false;
     this._ws.send(JSON.stringify({ type: 'command', action, ...extra }));
     return true;
+  }
+
+  setAudioPaused(paused) {
+    return this.sendCommand('set_audio_paused', { paused: Boolean(paused) });
   }
 
   destroy() {

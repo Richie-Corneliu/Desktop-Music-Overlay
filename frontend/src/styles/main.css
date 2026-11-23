@@ -132,8 +132,38 @@ body {
   background: conic-gradient(
     from 0deg,
     rgb(var(--c1-r, 132), var(--c1-g, 144), var(--c1-b, 168)) 0deg,
+    color-mix(
+      in srgb,
+      rgb(var(--c1-r, 132), var(--c1-g, 144), var(--c1-b, 168)) 78%,
+      rgb(var(--c2-r, 96), var(--c2-g, 108), var(--c2-b, 132))
+    ) 36deg,
+    color-mix(
+      in srgb,
+      rgb(var(--c1-r, 132), var(--c1-g, 144), var(--c1-b, 168)) 28%,
+      rgb(var(--c2-r, 96), var(--c2-g, 108), var(--c2-b, 132))
+    ) 84deg,
     rgb(var(--c2-r, 96), var(--c2-g, 108), var(--c2-b, 132)) 120deg,
+    color-mix(
+      in srgb,
+      rgb(var(--c2-r, 96), var(--c2-g, 108), var(--c2-b, 132)) 78%,
+      rgb(var(--c3-r, 156), var(--c3-g, 166), var(--c3-b, 188))
+    ) 156deg,
+    color-mix(
+      in srgb,
+      rgb(var(--c2-r, 96), var(--c2-g, 108), var(--c2-b, 132)) 28%,
+      rgb(var(--c3-r, 156), var(--c3-g, 166), var(--c3-b, 188))
+    ) 204deg,
     rgb(var(--c3-r, 156), var(--c3-g, 166), var(--c3-b, 188)) 240deg,
+    color-mix(
+      in srgb,
+      rgb(var(--c3-r, 156), var(--c3-g, 166), var(--c3-b, 188)) 78%,
+      rgb(var(--c1-r, 132), var(--c1-g, 144), var(--c1-b, 168))
+    ) 276deg,
+    color-mix(
+      in srgb,
+      rgb(var(--c3-r, 156), var(--c3-g, 166), var(--c3-b, 188)) 28%,
+      rgb(var(--c1-r, 132), var(--c1-g, 144), var(--c1-b, 168))
+    ) 324deg,
     rgb(var(--c1-r, 132), var(--c1-g, 144), var(--c1-b, 168)) 360deg
   );
 }
@@ -619,10 +649,9 @@ body.is-layout-editing .widget-badge {
   padding: 15px;
   border-radius: 18px;
   background: rgba(16, 19, 27, 0.8);
-  backdrop-filter: blur(18px) saturate(140%);
   border: 1px solid rgba(255, 255, 255, 0.14);
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.48);
-  display: flex;
+  display: none;
   flex-direction: column;
   gap: 11px;
   opacity: 0;
@@ -635,8 +664,14 @@ body.is-layout-editing .widget-badge {
 }
 
 .dock-drawer.is-open {
+  display: flex;
+  backdrop-filter: blur(18px) saturate(140%);
   opacity: 1;
   transform: translateY(0);
+}
+
+body.is-occluded .vinyl-disc.is-playing {
+  animation-play-state: paused;
 }
 
 .drawer-header {

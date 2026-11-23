@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import ctypes
+import io
 import json
 from pathlib import Path
 import sys
@@ -12,6 +14,7 @@ import time
 
 import httpx
 import numpy as np
+from PIL import Image
 from websockets.asyncio.client import connect
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -41,12 +44,18 @@ def test_fft_processor() -> None:
     assert peak > 0.4, f"Expected peak > 0.4, got {peak}"
     assert energy > 0.0
 
+    q_bytes, _q_energy, _q_peak, q_active = proc.process_quantized(sine)
+    assert isinstance(q_bytes, bytes) and len(q_bytes) == 64, "Expected 64-byte quantized FFT"
+    assert q_active is True and max(q_bytes) > 100
+
     for _ in range(40):
         bins, energy, peak, active = proc.process(None)
 
     assert active is False, "Expected active=False after silence"
     assert peak < 0.05, f"Expected peak < 0.05 after silence decay, got {peak}"
-    print(f"[PASS] FFTProcessor: 440Hz active peak recovered, silence decayed to {peak:.4f}")
+    q_idle, _, _, q_idle_active = proc.process_quantized(None)
+    assert q_idle_active is False and max(q_idle) <= 13
+    print(f"[PASS] FFTProcessor: 440Hz active peak + 64B uint8 quantization, decayed to {peak:.4f}")
 
 
 def test_lrc_parser() -> None:
@@ -226,16 +235,17 @@ async def test_ws_server_integration() -> None:
                 cmd_sent = False
                 while time.monotonic() - start < 1.5:
                     raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    if isinstance(raw, (bytes, bytearray)):
+                        assert len(raw) == 64, f"Expected 64 binary FFT bytes, got {len(raw)}"
+                        seen_types.add("audio")
+                        audio_frames.append({"len": len(raw)})
+                        continue
+
                     msg = json.loads(raw)
                     mtype = msg.get("type")
                     if mtype:
                         seen_types.add(mtype)
-                    if mtype == "audio":
-                        bins = msg.get("bins", [])
-                        assert len(bins) == 64, f"Expected 64 bins, got {len(bins)}"
-                        assert all(0.0 <= float(b) <= 1.0 for b in bins), "Bin out of bounds"
-                        audio_frames.append(msg)
-                    elif mtype == "ack":
+                    if mtype == "ack":
                         ack_msg = msg
 
                     if not cmd_sent and {"state", "lyrics", "history"}.issubset(seen_types):
@@ -247,6 +257,8 @@ async def test_ws_server_integration() -> None:
                     deadline = time.monotonic() + 0.5
                     while time.monotonic() < deadline and ack_msg is None:
                         raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                        if isinstance(raw, (bytes, bytearray)):
+                            continue
                         msg = json.loads(raw)
                         if msg.get("type") == "ack":
                             ack_msg = msg
@@ -292,8 +304,11 @@ async def test_nonblocking_startup_and_com_apartment() -> None:
             assert startup_sec < 0.5, f"Startup blocked by slow SMTC/audio ({startup_sec:.2f}s)"
             async with connect(f"ws://127.0.0.1:{server.port}") as ws:
                 seen = set()
-                for _ in range(5):
-                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=1.0))
+                for _ in range(25):
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    if isinstance(raw, (bytes, bytearray)):
+                        continue
+                    msg = json.loads(raw)
                     seen.add(msg.get("type"))
                     if {"state", "lyrics", "history"}.issubset(seen):
                         break
@@ -403,6 +418,11 @@ async def test_artwork_service() -> None:
             return httpx.Response(200, content=jpeg_bytes, headers={"Content-Type": "image/jpeg"})
         if "1200x1200bb.jpg" in url:
             return httpx.Response(200, content=png_bytes, headers={"Content-Type": "image/png"})
+        if "1024x1024-real.png" in url:
+            big = Image.new("RGB", (1024, 1024), (210, 40, 80))
+            buf = io.BytesIO()
+            big.save(buf, format="PNG")
+            return httpx.Response(200, content=buf.getvalue(), headers={"Content-Type": "image/png"})
         return httpx.Response(404)
 
     transport = httpx.MockTransport(handler)
@@ -427,7 +447,17 @@ async def test_artwork_service() -> None:
             assert uri3 and uri3.startswith("data:image/png;base64,")
             assert any("1200x1200bb.jpg" in u for u in calls), calls
 
-    print("[PASS] ArtworkService: Deezer + iTunes 1200px fallback + local cache")
+            # Real 1024x1024 image -> resized to <= 512x512 WebP/JPEG
+            real_uri = await svc2._download_data_uri("https://cdn.example/1024x1024-real.png")
+            assert real_uri and (
+                real_uri.startswith("data:image/webp;base64,")
+                or real_uri.startswith("data:image/jpeg;base64,")
+            ), f"Unexpected resized mime: {real_uri[:40] if real_uri else None}"
+            raw_resized = base64.b64decode(real_uri.split(",", 1)[1])
+            with Image.open(io.BytesIO(raw_resized)) as im:
+                assert im.size == (512, 512), f"Expected (512, 512), got {im.size}"
+
+    print("[PASS] ArtworkService: Deezer + iTunes 1200px fallback + 512x512 resize + local cache")
 
 
 class _SwitchableSMTC:
@@ -503,7 +533,10 @@ async def test_artwork_server_upgrade() -> None:
                     thumbs: list[str] = []
                     deadline = time.monotonic() + 2.5
                     while time.monotonic() < deadline and len(thumbs) < 2:
-                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=1.0))
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        if isinstance(raw, (bytes, bytearray)):
+                            continue
+                        msg = json.loads(raw)
                         if msg.get("type") == "state" and msg.get("media"):
                             t = msg["media"].get("thumbnail")
                             if t and (not thumbs or thumbs[-1] != t):
@@ -521,6 +554,133 @@ async def test_artwork_server_upgrade() -> None:
     print("[PASS] Server HD artwork: instant SMTC then HD upgrade preserved across polls")
 
 
+class _MockControllableAudio:
+    def __init__(self) -> None:
+        self.active = False
+        self.armed = False
+        self.cb = None
+        self.calls = 0
+
+    def start(self) -> bool:
+        return True
+
+    def stop(self) -> None:
+        pass
+
+    def check_and_rebind(self) -> bool:
+        return False
+
+    def set_signal_callback(self, cb) -> None:
+        self.cb = cb
+
+    def arm_signal_wakeup(self, armed: bool = True) -> None:
+        self.armed = bool(armed)
+
+    def trigger_audio(self) -> None:
+        self.active = True
+        if self.armed and self.cb:
+            self.armed = False
+            self.cb()
+
+    def get_binary_frame(self) -> tuple[bytes, float, float, bool]:
+        self.calls += 1
+        if self.active:
+            return bytes([180] * 64), 0.7, 0.7, True
+        return b"\x00" * 64, 0.0, 0.0, False
+
+
+async def test_audio_deep_idle_and_pause() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        audio = _MockControllableAudio()
+        server = MusicOverlayServer(
+            host="127.0.0.1",
+            port=0,
+            smtc=_SlowSMTC(),  # type: ignore[arg-type]
+            audio=audio,  # type: ignore[arg-type]
+            lyrics=LyricsService(cache_path=tmp_dir / "lyrics.json"),
+            history=HistoryStore(history_path=tmp_dir / "history.json"),
+        )
+        await server.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{server.port}") as ws:
+                # Drain initial JSON snapshot
+                seen_init: set[str] = set()
+                while not {"state", "lyrics", "history"}.issubset(seen_init):
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    if isinstance(raw, str):
+                        m = json.loads(raw)
+                        if m.get("type"):
+                            seen_init.add(m["type"])
+
+                # Wait past 2.0s silence threshold so server enters deep-idle
+                deadline = time.monotonic() + 2.4
+                while time.monotonic() < deadline:
+                    try:
+                        await asyncio.wait_for(ws.recv(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        pass
+
+                # During deep-idle, zero binary frames sent and polling is ~5Hz
+                calls_before = audio.calls
+                await asyncio.sleep(0.55)
+                calls_delta = audio.calls - calls_before
+                assert 1 <= calls_delta <= 5, f"Expected ~5Hz deep-idle polling, got {calls_delta} calls in 0.55s"
+                assert audio.armed is True, "Expected signal wakeup armed during deep-idle"
+
+                got_unexpected_binary = False
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                    if isinstance(msg, (bytes, bytearray)):
+                        got_unexpected_binary = True
+                except asyncio.TimeoutError:
+                    pass
+                assert not got_unexpected_binary, "Should stop broadcasting audio frames in deep-idle"
+
+                # Instant wakeup when audio signal returns
+                t_wake = time.monotonic()
+                audio.trigger_audio()
+                resumed_frame = await asyncio.wait_for(ws.recv(), timeout=0.12)
+                wake_ms = (time.monotonic() - t_wake) * 1000.0
+                assert isinstance(resumed_frame, (bytes, bytearray)) and len(resumed_frame) == 64
+                assert max(resumed_frame) == 180
+
+                # Explicit occlusion pause stops binary streaming until resumed
+                await ws.send(json.dumps({"type": "command", "action": "set_audio_paused", "paused": True}))
+                ack_pause = None
+                for _ in range(30):
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                    if isinstance(raw, str):
+                        m = json.loads(raw)
+                        if m.get("type") == "ack" and m.get("command") == "set_audio_paused":
+                            ack_pause = m
+                            break
+                assert ack_pause and ack_pause.get("ok") is True
+
+                await asyncio.sleep(0.15)
+                paused_binary = False
+                try:
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                        if isinstance(raw, (bytes, bytearray)):
+                            paused_binary = True
+                except asyncio.TimeoutError:
+                    pass
+                assert not paused_binary, "Audio frames leaked while client paused"
+
+                await ws.send(json.dumps({"type": "command", "action": "set_audio_paused", "paused": False}))
+                resumed_after_pause = None
+                for _ in range(10):
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                    if isinstance(raw, (bytes, bytearray)):
+                        resumed_after_pause = raw
+                        break
+                assert resumed_after_pause and len(resumed_after_pause) == 64
+                print(f"[PASS] Audio deep-idle (5Hz={calls_delta}/0.55s, wake={wake_ms:.1f}ms) + occlusion pause")
+        finally:
+            await server.stop()
+
+
 async def main() -> None:
     test_fft_processor()
     test_lrc_parser()
@@ -531,6 +691,7 @@ async def main() -> None:
     await test_audio_auto_rebind()
     await test_nonblocking_startup_and_com_apartment()
     await test_artwork_server_upgrade()
+    await test_audio_deep_idle_and_pause()
     await test_ws_server_integration()
     print("ALL PHASE 1 TESTS PASSED")
 

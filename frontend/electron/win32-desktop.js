@@ -13,6 +13,12 @@ let api = null;
 if (koffi) {
   try {
     const user32 = koffi.load('user32.dll');
+    const RECT = koffi.struct('RECT', {
+      left: 'long',
+      top: 'long',
+      right: 'long',
+      bottom: 'long',
+    });
     api = {
       FindWindowA: user32.func('__stdcall', 'FindWindowA', 'intptr_t', ['str', 'str']),
       FindWindowExA: user32.func('__stdcall', 'FindWindowExA', 'intptr_t', [
@@ -39,6 +45,18 @@ if (koffi) {
         'int',
         'uint32',
       ]),
+      GetForegroundWindow: user32.func('__stdcall', 'GetForegroundWindow', 'intptr_t', []),
+      GetWindowRect: user32.func('__stdcall', 'GetWindowRect', 'bool', [
+        'intptr_t',
+        koffi.out(koffi.pointer(RECT)),
+      ]),
+      GetClassNameW: user32.func('__stdcall', 'GetClassNameW', 'int', [
+        'intptr_t',
+        koffi.out('uint16_t*'),
+        'int',
+      ]),
+      IsWindowVisible: user32.func('__stdcall', 'IsWindowVisible', 'bool', ['intptr_t']),
+      IsIconic: user32.func('__stdcall', 'IsIconic', 'bool', ['intptr_t']),
     };
   } catch (err) {
     console.warn('[win32-desktop] user32 bindings failed:', err.message);
@@ -56,6 +74,15 @@ const SWP_NOSIZE = 0x0001;
 const SWP_NOMOVE = 0x0002;
 const SWP_NOACTIVATE = 0x0010;
 const SWP_FLAGS = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+const OCCLUSION_TOLERANCE_PX = 12;
+const IGNORED_OCCLUDER_CLASSES = new Set([
+  'Progman',
+  'WorkerW',
+  'Shell_TrayWnd',
+  'Shell_SecondaryTrayWnd',
+  '#32769',
+]);
+const _classNameBuf = new Uint16Array(128);
 
 function getHwnd(win) {
   if (!win || win.isDestroyed()) return 0n;
@@ -160,10 +187,53 @@ function setTopmostMode(win, enabled) {
   }
 }
 
+function getWindowClassName(hwnd) {
+  if (!api || hwnd === 0n) return '';
+  const len = api.GetClassNameW(hwnd, _classNameBuf, _classNameBuf.length);
+  if (len <= 0) return '';
+  return String.fromCharCode(..._classNameBuf.subarray(0, len));
+}
+
+function isDesktopOccluded(win) {
+  if (!api || !win || win.isDestroyed()) return false;
+  try {
+    const ownHwnd = getHwnd(win);
+    if (ownHwnd === 0n) return false;
+
+    const fgHwnd = BigInt(api.GetForegroundWindow() || 0);
+    if (fgHwnd === 0n || fgHwnd === ownHwnd) return false;
+    if (!api.IsWindowVisible(fgHwnd) || api.IsIconic(fgHwnd)) return false;
+
+    const cls = getWindowClassName(fgHwnd);
+    if (IGNORED_OCCLUDER_CLASSES.has(cls)) return false;
+
+    const ownRect = {};
+    const fgRect = {};
+    if (!api.GetWindowRect(ownHwnd, ownRect) || !api.GetWindowRect(fgHwnd, fgRect)) {
+      return false;
+    }
+
+    const ownW = ownRect.right - ownRect.left;
+    const ownH = ownRect.bottom - ownRect.top;
+    if (ownW <= 0 || ownH <= 0) return false;
+
+    return (
+      fgRect.left <= ownRect.left + OCCLUSION_TOLERANCE_PX &&
+      fgRect.top <= ownRect.top + OCCLUSION_TOLERANCE_PX &&
+      fgRect.right >= ownRect.right - OCCLUSION_TOLERANCE_PX &&
+      fgRect.bottom >= ownRect.bottom - OCCLUSION_TOLERANCE_PX
+    );
+  } catch (err) {
+    console.warn('[win32-desktop] isDesktopOccluded failed:', err.message);
+    return false;
+  }
+}
+
 module.exports = {
   isAvailable: Boolean(api),
   applyToolWindowStyle,
   attachDesktopMode,
+  isDesktopOccluded,
   sendToBottom,
   setTopmostMode,
 };

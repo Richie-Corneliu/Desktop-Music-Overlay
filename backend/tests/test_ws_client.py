@@ -55,6 +55,27 @@ async def run_client(url: str, duration: float | None, command: str | None) -> N
             nonlocal state, lyrics, audio_count, window_start, last_print, last_lyric_line
             try:
                 async for raw in ws:
+                    if isinstance(raw, (bytes, bytearray)):
+                        audio_count += 1
+                        now = time.monotonic()
+                        if now - last_print >= 1.0:
+                            dt = now - window_start
+                            hz = audio_count / max(0.01, dt)
+                            bins = [b / 255.0 for b in raw]
+                            energy = sum(bins) / max(1, len(bins))
+                            peak = max(bins) if bins else 0.0
+                            eq = _render_bars(bins)
+                            print(
+                                f"[AUDIO-BIN] {hz:5.1f} Hz | bytes={len(raw)} "
+                                f"energy={energy:.3f} peak={peak:.3f} |{eq}|"
+                            )
+                            audio_count = 0
+                            window_start = now
+                            last_print = now
+                        if stop_event.is_set():
+                            break
+                        continue
+
                     msg = json.loads(raw)
                     mtype = msg.get("type")
 
