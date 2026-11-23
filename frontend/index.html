@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src ws://localhost:8765 ws://127.0.0.1:8765 http://127.0.0.1:5173 ws://127.0.0.1:5173;"
+    />
+    <title>Music Overlay</title>
+  </head>
+  <body>
+    <div id="screen-edge-glow" class="screen-edge-glow" aria-hidden="true">
+      <div id="edge-bloom-frame" class="edge-bloom-frame">
+        <div class="edge-side edge-side--top">
+          <div class="edge-conic-rotor"></div>
+        </div>
+        <div class="edge-side edge-side--right">
+          <div class="edge-conic-rotor"></div>
+        </div>
+        <div class="edge-side edge-side--bottom">
+          <div class="edge-conic-rotor"></div>
+        </div>
+        <div class="edge-side edge-side--left">
+          <div class="edge-conic-rotor"></div>
+        </div>
+      </div>
+      <div id="edge-inset-rim" class="edge-inset-rim"></div>
+    </div>
+
+    <section
+      id="lyrics-region"
+      class="lyrics-region widget-box is-hidden"
+      data-widget="lyrics"
+      aria-label="Synced lyrics"
+      aria-live="polite"
+    >
+      <span class="widget-badge" aria-hidden="true">LYRICS 100%</span>
+      <div id="lyrics-stage" class="lyrics-stage"></div>
+    </section>
+
+    <header
+      id="clock-region"
+      class="clock-region widget-box"
+      data-widget="clock"
+      data-clock-style="editorial"
+      aria-label="Clock"
+    >
+      <span class="widget-badge" aria-hidden="true">CLOCK 100%</span>
+      <time id="clock-time" class="clock-time" datetime="00:00">
+        <span class="clock-hour">00</span><span class="clock-sep" aria-hidden="true">:</span><span class="clock-min">00</span>
+      </time>
+      <div id="clock-date" class="clock-date">KAMIS • 19 NOV</div>
+    </header>
+
+    <main
+      id="visualizer-region"
+      class="stage-center widget-box"
+      data-widget="visualizer"
+    >
+      <span class="widget-badge" aria-hidden="true">VISUALIZER 100%</span>
+      <div class="visualizer-wrap">
+        <canvas
+          id="visualizer-canvas"
+          class="visualizer-canvas"
+          aria-hidden="true"
+        ></canvas>
+
+        <div id="cover-shell" class="cover-shell is-idle">
+          <img
+            id="cover-image"
+            class="cover-image"
+            src=""
+            alt=""
+            width="240"
+            height="240"
+            fetchpriority="high"
+            decoding="async"
+          />
+          <div id="cover-placeholder" class="cover-placeholder" aria-hidden="true">
+            <div class="cover-spindle"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="track-caption" class="track-caption is-idle" aria-live="polite">
+        <h1 id="track-title" class="track-title">No active media</h1>
+        <p id="track-artist" class="track-artist">Waiting for playback</p>
+      </div>
+    </main>
+
+    <aside
+      id="dock-root"
+      class="dock-root interactive"
+      aria-label="Music controls and history"
+    >
+      <section
+        id="dock-drawer"
+        class="dock-drawer"
+        aria-label="Player drawer"
+        hidden
+      >
+        <div class="drawer-header">
+          <div class="drawer-now">
+            <p id="dock-track-title" class="drawer-title">No active media</p>
+            <p id="dock-track-artist" class="drawer-artist">Waiting for playback</p>
+          </div>
+          <div class="drawer-transport">
+            <button
+              id="btn-prev"
+              type="button"
+              class="transport-btn"
+              aria-label="Previous track"
+              title="Previous"
+            >
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+                <rect x="5" y="5" width="2.5" height="14" rx="1" />
+                <polygon points="18,5 8.5,12 18,19" />
+              </svg>
+            </button>
+            <button
+              id="btn-play-pause"
+              type="button"
+              class="transport-btn transport-primary"
+              aria-label="Play"
+              title="Play / Pause"
+            ></button>
+            <button
+              id="btn-next"
+              type="button"
+              class="transport-btn"
+              aria-label="Next track"
+              title="Next"
+            >
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+                <polygon points="6,5 15.5,12 6,19" />
+                <rect x="16.5" y="5" width="2.5" height="14" rx="1" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="dock-actions-row">
+          <div class="dock-actions" role="group" aria-label="Overlay actions">
+            <button
+              id="btn-refresh-lyrics"
+              type="button"
+              class="action-circle-btn"
+              aria-label="Refresh lyrics"
+              title="Refresh lyrics"
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <polyline points="21 3 21 9 15 9" />
+              </svg>
+            </button>
+
+            <button
+              id="btn-theme-mode"
+              type="button"
+              class="action-circle-btn"
+              aria-label="Switch glow theme"
+              title="Glow theme: Dynamic"
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+              </svg>
+            </button>
+
+            <button
+              id="btn-layout-lock"
+              type="button"
+              class="action-circle-btn"
+              aria-label="Unlock layout to drag and scale"
+              aria-pressed="false"
+              title="Unlock layout (drag & wheel)"
+            ></button>
+
+            <button
+              id="btn-hide-overlay"
+              type="button"
+              class="action-circle-btn"
+              aria-label="Hide overlay"
+              title="Hide overlay"
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a21.77 21.77 0 0 1 5.06-5.94" />
+                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a21.8 21.8 0 0 1-2.88 4.19" />
+                <line x1="2" y1="2" x2="22" y2="22" />
+              </svg>
+            </button>
+          </div>
+
+          <span id="theme-mode-badge" class="theme-mode-badge">Dynamic</span>
+        </div>
+
+        <div class="layout-utility-row">
+          <div class="utility-switches">
+            <div class="clock-toggle-wrap">
+              <span class="utility-label" id="clock-switch-label">Digital Clock</span>
+              <button
+                id="btn-toggle-clock"
+                type="button"
+                role="switch"
+                aria-checked="true"
+                aria-labelledby="clock-switch-label"
+                class="switch-btn is-on"
+              >
+                <span class="switch-knob" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+
+          <button id="btn-reset-layout" type="button" class="reset-layout-btn">
+            Reset Layout
+          </button>
+        </div>
+
+        <div class="appearance-controls">
+          <div class="control-group">
+            <span class="utility-label">Clock Style</span>
+            <div class="segmented-group" role="group" aria-label="Clock style">
+              <button id="btn-clock-editorial" type="button" class="seg-btn is-active" data-clock-style="editorial" aria-pressed="true">Editorial</button>
+              <button id="btn-clock-stacked" type="button" class="seg-btn" data-clock-style="stacked" aria-pressed="false">Stacked</button>
+              <button id="btn-clock-minimal" type="button" class="seg-btn" data-clock-style="minimal" aria-pressed="false">Minimal</button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <span class="utility-label">Screen Edge</span>
+            <div class="segmented-group" role="group" aria-label="Screen edge glow mode">
+              <button id="btn-edge-off" type="button" class="seg-btn" data-edge-mode="off" aria-pressed="false">Off</button>
+              <button id="btn-edge-minimalist" type="button" class="seg-btn" data-edge-mode="minimalist" aria-pressed="false">Minimalist</button>
+              <button id="btn-edge-dynamic" type="button" class="seg-btn is-active" data-edge-mode="dynamic" aria-pressed="true">Dynamic</button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <div class="control-label-row">
+              <label class="utility-label" for="slider-night-brightness">Night Brightness</label>
+              <span id="night-brightness-value" class="control-readout">100%</span>
+            </div>
+            <input
+              id="slider-night-brightness"
+              class="night-slider"
+              type="range"
+              min="25"
+              max="100"
+              step="1"
+              value="100"
+              aria-label="Night brightness"
+            />
+          </div>
+
+          <div class="sleep-timer-row">
+            <button id="btn-sleep-timer" type="button" class="sleep-timer-btn">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+              </svg>
+              <span>Sleep Timer</span>
+            </button>
+            <span id="sleep-timer-countdown" class="sleep-countdown">Off</span>
+          </div>
+        </div>
+
+        <div class="history-section">
+          <div class="history-tabs" role="tablist" aria-label="Track history">
+            <button
+              id="tab-recent"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              class="history-tab is-active"
+            >
+              Recent (0)
+            </button>
+            <button
+              id="tab-pinned"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              class="history-tab"
+            >
+              Pinned (0)
+            </button>
+          </div>
+
+          <div id="history-list" class="history-list" role="tabpanel"></div>
+        </div>
+      </section>
+
+      <button
+        id="vinyl-trigger"
+        type="button"
+        class="vinyl-trigger"
+        aria-expanded="false"
+        aria-controls="dock-drawer"
+        aria-label="Open music dock"
+      >
+        <span id="vinyl-disc" class="vinyl-disc">
+          <img
+            id="vinyl-cover"
+            class="vinyl-cover"
+            src=""
+            alt=""
+            width="28"
+            height="28"
+            decoding="async"
+          />
+          <span class="vinyl-spindle" aria-hidden="true"></span>
+        </span>
+      </button>
+    </aside>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
